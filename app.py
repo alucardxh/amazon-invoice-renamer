@@ -19,13 +19,11 @@ APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 CONFIG_PATH = Path(sys.argv[0]).resolve().parent / "category_rules.json"
 
 DEFAULT_RULES = {
-    "本部お菓子": ["ウエハース", "コンフェクト", "クッキー", "チョコ", "お菓子", "スナック"],
-    "本部文房具": ["ノート", "ペン", "クリップ", "ファイル"],
-    "本部日用品": ["タオル", "洗剤", "ティッシュ", "ハンドウォッシュ", "除菌", "洗浄", "キュキュット"],
-    "本部電化製品": ["チャイム", "インターホン", "ワイヤレス", "Bluetooth", "充電"],
+    "お菓子": ["ウエハース", "コンフェクト", "クッキー", "チョコ", "お菓子", "スナック"],
+    "文房具": ["ノート", "ペン", "クリップ", "ファイル"],
+    "日用品": ["タオル", "洗剤", "ティッシュ", "ハンドウォッシュ", "除菌", "洗浄", "キュキュット"],
+    "電化製品": ["チャイム", "インターホン", "ワイヤレス", "Bluetooth", "充電"],
 }
-
-FILENAME_PATTERN = re.compile(r"^\d{8}_Amazon_.+_\d+\.pdf$", re.IGNORECASE)
 
 
 def load_rules() -> dict:
@@ -44,10 +42,11 @@ def save_rules(rules: dict):
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
 
-def parse_pdf_blocks(pdf_path: Path, rules: dict) -> list:
-    """逐页解析。一个PDF里可能塞了多张独立发票（比如供应商的支払い明細書 + Amazon自己的适格请求书），
-    每页若能匹配到一组独立的"请求书番号+合计"就算一个block；纯续页（没有新发票头）会被跳过。"""
+def _parse_blocks(pdf_path: Path, rules: dict) -> list:
+    """逐页解析，同一发票号只取第一页（多页发票后续页跳过）。
+    一个PDF里若有多张独立发票（不同发票号），每张各自生成一个block。"""
     blocks = []
+    seen_inv = set()
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -56,25 +55,30 @@ def parse_pdf_blocks(pdf_path: Path, rules: dict) -> list:
             if not m:
                 continue
 
+            invoice_no = m.group(1)
+            if invoice_no in seen_inv:
+                continue  # 多页发票后续页重复同一发票号，跳过
+            seen_inv.add(invoice_no)
+
             total = int(m.group(2).replace(",", ""))
 
             m_date = re.search(r"請求書発行日\s*[:\s]*\s*(\d{4})-(\d{2})-(\d{2})", text)
             date = f"{m_date.group(1)}{m_date.group(2)}{m_date.group(3)}" if m_date else None
 
             # 商品名常跨多行，单独按行匹配会漏判，所以直接在整页文本里查找关键词
-            category = "本部未分类"
+            category = "未分类"
             for cat, keywords in rules.items():
                 if any(kw in text for kw in keywords):
                     category = cat
                     break
 
-            blocks.append({"date": date, "total": total, "category": category})
+            blocks.append({"invoice_no": invoice_no, "date": date, "total": total, "category": category})
     return blocks
 
 
-def build_filename(blocks: list) -> str:
+def _build_filename(blocks: list) -> str:
     if not blocks:
-        return "00000000_Amazon_本部未分类_0.pdf"
+        return "00000000_Amazon_未分类_0.pdf"
 
     date = next((b["date"] for b in blocks if b["date"]), "00000000")
     total_sum = sum(b["total"] for b in blocks)
@@ -88,7 +92,7 @@ def build_filename(blocks: list) -> str:
     return f"{date}_Amazon_{category_str}_{total_sum}.pdf"
 
 
-def unique_path(path: Path) -> Path:
+def _unique_path(path: Path) -> Path:
     """若目标文件名已存在，追加 _1 _2 避免覆盖"""
     if not path.exists():
         return path
@@ -99,6 +103,55 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+class InvoiceFile:
+    """封装单个 PDF 的路径、解析结果和处理状态。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.blocks: list = []
+        self.error: str = ""
+        self.dup_warnings: list = []  # 由外部跨文件检测后写入
+        self.new_path: Path = None
+
+    # ── 属性 ──────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def invoice_numbers(self) -> list:
+        return [b["invoice_no"] for b in self.blocks]
+
+    @property
+    def new_name(self) -> str:
+        base = _build_filename(self.blocks)
+        if self.dup_warnings:
+            return base[:-4] + "_重複.pdf"
+        return base
+
+    @property
+    def has_unclassified(self) -> bool:
+        return any(b["category"] == "未分类" for b in self.blocks)
+
+    # ── 操作 ──────────────────────────────────────────────
+
+    def parse(self, rules: dict):
+        try:
+            self.blocks = _parse_blocks(self.path, rules)
+        except Exception as e:
+            self.error = str(e)
+
+    def rename(self):
+        stem = self.new_name[:-4]
+        if re.match(rf"^{re.escape(stem)}(_\d+|_重複)?\.pdf$", self.path.name):
+            self.new_path = self.path  # 已是目标名或其 _N/_重複 变体，无需改动
+            return
+        target = _unique_path(self.path.parent / self.new_name)
+        self.path.rename(target)
+        self.new_path = target
 
 
 class CategoryEditor(tk.Toplevel):
@@ -199,6 +252,7 @@ class App(tk.Tk):
         self.tree.column("original", width=260)
         self.tree.column("new", width=320)
         self.tree.column("status", width=120)
+        self.tree.tag_configure("warning", foreground="red")
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
 
     def choose_folder(self):
@@ -228,34 +282,51 @@ class App(tk.Tk):
             self.start_btn.config(state="normal")
             return
 
-        for idx, pdf_path in enumerate(pdf_files, 1):
-            self._set_progress(f"处理中 {idx}/{total}: {pdf_path.name}")
+        # 步骤一：解析所有文件
+        invoices = []
+        for idx, path in enumerate(pdf_files, 1):
+            self._set_progress(f"解析中 {idx}/{total}: {path.name}")
+            inv = InvoiceFile(path)
+            inv.parse(self.rules)
+            invoices.append(inv)
 
-            if FILENAME_PATTERN.match(pdf_path.name):
-                self._add_row(pdf_path.name, "(已是目标格式，跳过)", "跳过")
+        # 步骤二：跨文件重复检测（同一发票号出现在不同文件里）
+        seen_inv = {}
+        for inv in invoices:
+            for no in inv.invoice_numbers:
+                if no in seen_inv:
+                    inv.dup_warnings.append(f"{no}(与 {seen_inv[no]} 重复)")
+                else:
+                    seen_inv[no] = inv.name
+
+        # 步骤三：重命名并展示结果
+        for idx, inv in enumerate(invoices, 1):
+            self._set_progress(f"重命名 {idx}/{total}: {inv.name}")
+
+            if inv.error:
+                self._add_row(inv.name, f"出错: {inv.error}", "失败")
+                continue
+
+            if not inv.blocks:
+                self._add_row(inv.name, "未识别到日期/金额，未重命名", "失败")
                 continue
 
             try:
-                blocks = parse_pdf_blocks(pdf_path, self.rules)
-                if not blocks:
-                    self._add_row(pdf_path.name, "未识别到日期/金额，未重命名", "失败")
-                    continue
-
-                new_name = build_filename(blocks)
-                new_path = unique_path(pdf_path.parent / new_name)
-                pdf_path.rename(new_path)
-
-                has_unclassified = any(b["category"] == "本部未分类" for b in blocks)
-                status = "成功(含未分类)" if has_unclassified else "成功"
-                self._add_row(pdf_path.name, new_path.name, status)
+                inv.rename()
+                if inv.new_path == inv.path:
+                    self._add_row(inv.name, inv.name, "无需改动")
+                else:
+                    status = "成功(含未分类)" if inv.has_unclassified else "成功"
+                    self._add_row(inv.name, inv.new_path.name, status, warning=bool(inv.dup_warnings))
             except Exception as e:
-                self._add_row(pdf_path.name, f"出错: {e}", "失败")
+                self._add_row(inv.name, f"出错: {e}", "失败")
 
         self._set_progress(f"完成，共处理 {total} 个文件")
         self.start_btn.config(state="normal")
 
-    def _add_row(self, original, new, status):
-        self.tree.insert("", "end", values=(original, new, status))
+    def _add_row(self, original, new, status, warning=False):
+        tags = ("warning",) if warning else ()
+        self.tree.insert("", "end", values=(original, new, status), tags=tags)
 
     def _set_progress(self, text):
         self.progress_label.config(text=text)
