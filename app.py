@@ -21,7 +21,8 @@ CONFIG_PATH = Path(sys.argv[0]).resolve().parent / "category_rules.json"
 DEFAULT_RULES = {
     "本部お菓子": ["ウエハース", "コンフェクト", "クッキー", "チョコ", "お菓子", "スナック"],
     "本部文房具": ["ノート", "ペン", "クリップ", "ファイル"],
-    "本部日用品": ["タオル", "洗剤", "ティッシュ"],
+    "本部日用品": ["タオル", "洗剤", "ティッシュ", "ハンドウォッシュ", "除菌", "洗浄", "キュキュット"],
+    "本部電化製品": ["チャイム", "インターホン", "ワイヤレス", "Bluetooth", "充電"],
 }
 
 FILENAME_PATTERN = re.compile(r"^\d{8}_Amazon_.+_\d+\.pdf$", re.IGNORECASE)
@@ -43,46 +44,48 @@ def save_rules(rules: dict):
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
 
-def extract_text(pdf_path: Path) -> str:
-    text = ""
+def parse_pdf_blocks(pdf_path: Path, rules: dict) -> list:
+    """逐页解析。一个PDF里可能塞了多张独立发票（比如供应商的支払い明細書 + Amazon自己的适格请求书），
+    每页若能匹配到一组独立的"请求书番号+合计"就算一个block；纯续页（没有新发票头）会被跳过。"""
+    blocks = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
-            text += (page.extract_text() or "") + "\n"
-    return text
+            text = page.extract_text() or ""
+
+            m = re.search(r"請求書番号\s*([A-Z0-9]+)\s*合計\s*￥\s*([\d,]+)", text)
+            if not m:
+                continue
+
+            total = int(m.group(2).replace(",", ""))
+
+            m_date = re.search(r"請求書発行日\s*[:\s]*\s*(\d{4})-(\d{2})-(\d{2})", text)
+            date = f"{m_date.group(1)}{m_date.group(2)}{m_date.group(3)}" if m_date else None
+
+            # 商品名常跨多行，单独按行匹配会漏判，所以直接在整页文本里查找关键词
+            category = "本部未分类"
+            for cat, keywords in rules.items():
+                if any(kw in text for kw in keywords):
+                    category = cat
+                    break
+
+            blocks.append({"date": date, "total": total, "category": category})
+    return blocks
 
 
-def parse_invoice(text: str, rules: dict) -> dict:
-    info = {}
+def build_filename(blocks: list) -> str:
+    if not blocks:
+        return "00000000_Amazon_本部未分类_0.pdf"
 
-    m = re.search(r"請求書発行日\s*[:\s]*\s*(\d{4})-(\d{2})-(\d{2})", text)
-    if m:
-        info["date"] = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    date = next((b["date"] for b in blocks if b["date"]), "00000000")
+    total_sum = sum(b["total"] for b in blocks)
 
-    m = re.search(r"請求書番号\s*([A-Z0-9]+)\s*合計\s*￥\s*([\d,]+)", text)
-    if m:
-        info["total"] = m.group(2).replace(",", "")
-    else:
-        amounts = [int(a.replace(",", "")) for a in re.findall(r"合計\s*￥\s*([\d,]+)", text)]
-        if amounts:
-            info["total"] = str(max(amounts))
+    categories = []
+    for b in blocks:
+        if b["category"] not in categories:
+            categories.append(b["category"])
+    category_str = "・".join(categories)
 
-    items = re.findall(r"^(.*?)\s*\|\s*[A-Z0-9]{10}\b", text, flags=re.MULTILINE)
-    info["items"] = items
-
-    category = "本部未分类"
-    for cat, keywords in rules.items():
-        if any(kw in item for item in items for kw in keywords):
-            category = cat
-            break
-    info["category"] = category
-    return info
-
-
-def build_filename(info: dict) -> str:
-    date = info.get("date", "00000000")
-    total = info.get("total", "0")
-    category = info.get("category", "本部未分类")
-    return f"{date}_Amazon_{category}_{total}.pdf"
+    return f"{date}_Amazon_{category_str}_{total_sum}.pdf"
 
 
 def unique_path(path: Path) -> Path:
@@ -141,7 +144,7 @@ class CategoryEditor(tk.Toplevel):
         kw_entry.insert(0, kw_val)
         kw_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
         del_btn = ttk.Button(row, text="删除", width=6,
-                              command=lambda: self._remove_row(row))
+                             command=lambda: self._remove_row(row))
         del_btn.pack(side="left")
         self.rows.append((cat_entry, kw_entry, row))
 
@@ -233,17 +236,17 @@ class App(tk.Tk):
                 continue
 
             try:
-                text = extract_text(pdf_path)
-                info = parse_invoice(text, self.rules)
-                if "date" not in info or "total" not in info:
-                    self._add_row(pdf_path.name, "缺少日期或金额，未重命名", "失败")
+                blocks = parse_pdf_blocks(pdf_path, self.rules)
+                if not blocks:
+                    self._add_row(pdf_path.name, "未识别到日期/金额，未重命名", "失败")
                     continue
 
-                new_name = build_filename(info)
+                new_name = build_filename(blocks)
                 new_path = unique_path(pdf_path.parent / new_name)
                 pdf_path.rename(new_path)
 
-                status = "成功" if info.get("category") != "本部未分类" else "成功(未分类)"
+                has_unclassified = any(b["category"] == "本部未分类" for b in blocks)
+                status = "成功(含未分类)" if has_unclassified else "成功"
                 self._add_row(pdf_path.name, new_path.name, status)
             except Exception as e:
                 self._add_row(pdf_path.name, f"出错: {e}", "失败")
